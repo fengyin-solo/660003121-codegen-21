@@ -55,3 +55,23 @@ export interface ASTNode {
   children?: ASTNode[]
   groupIndex?: number
 }
+
+export type RiskLevel = 'safe' | 'low' | 'medium' | 'high' | 'critical'
+
+export interface RiskSource {
+  type: 'nested_quantifier' | 'overlapping_alternation' | 'adjacent_repeating' | 'greedy_with_backtrack' | 'wide_charclass'
+  description: string
+  pattern: string
+  position: number
+  suggestion: string
+  badExample: string
+  goodExample: string
+}
+
+export interface ComplexityEstimate {
+  riskLevel: RiskLevel
+  estimatedComplexity: string
+  riskSources: RiskSource[]
+  maxBacktrackPotential: number
+  warning: string | null
+}

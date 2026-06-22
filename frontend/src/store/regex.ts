@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode } from '../types'
+import type { NFA, MatchResult, MatchStep, RegexTemplate, ASTNode, ComplexityEstimate, RiskSource, RiskLevel } from '../types'
 
 const GROUP_COLORS = ['#ef4444', '#f97316', '#eab308', '#22c55e', '#3b82f6', '#8b5cf6', '#ec4899', '#14b8a6']
 
@@ -391,6 +391,293 @@ export function parseAST(pattern: string): ASTNode {
   return parseOr()
 }
 
+export function analyzeComplexity(pattern: string, testString: string): ComplexityEstimate {
+  const riskSources: RiskSource[] = []
+  let riskLevel = 'safe' as RiskLevel
+  let maxBacktrackPotential = 0
+
+  function addRisk(source: RiskSource) {
+    riskSources.push(source)
+  }
+
+  function upgradeRisk(newLevel: RiskLevel) {
+    const order: RiskLevel[] = ['safe', 'low', 'medium', 'high', 'critical']
+    if (order.indexOf(newLevel) > order.indexOf(riskLevel)) {
+      riskLevel = newLevel
+    }
+  }
+
+  const quantifiers = /[*+?]|\{\d+,\d*\}|\{\d*,\d+\}|\{\d+\}/g
+
+  function checkNestedQuantifiers(pattern: string) {
+    const groupStack: number[] = []
+    const groupHasQuantifier: Map<number, boolean> = new Map()
+    let depth = 0
+
+    for (let i = 0; i < pattern.length; i++) {
+      const ch = pattern[i]
+      if (ch === '(') {
+        depth++
+        groupStack.push(i)
+      } else if (ch === ')' && groupStack.length > 0) {
+        const groupStart = groupStack.pop()!
+        depth--
+        if (i + 1 < pattern.length && quantifiers.test(pattern[i + 1])) {
+          quantifiers.lastIndex = 0
+          if (depth >= 1) {
+            addRisk({
+              type: 'nested_quantifier',
+              description: '嵌套量词：分组内已含有量词，外层再次施加量词会导致指数级回溯',
+              pattern: pattern.substring(groupStart, i + 2),
+              position: groupStart,
+              suggestion: '使用非捕获分组(?:)或展开循环避免嵌套量词，考虑用原子组或占有优先量词',
+              badExample: '(a+)+b',
+              goodExample: 'a+b 或 (?:a+)b'
+            })
+            upgradeRisk('critical')
+            maxBacktrackPotential = Math.max(maxBacktrackPotential, 10000)
+          }
+        }
+        if (groupHasQuantifier.has(groupStart)) {
+          groupHasQuantifier.delete(groupStart)
+        }
+      } else if (quantifiers.test(ch)) {
+        quantifiers.lastIndex = 0
+        if (groupStack.length > 0) {
+          groupHasQuantifier.set(groupStack[groupStack.length - 1], true)
+        }
+      }
+    }
+
+    const nestedPatterns = [
+      /\(([^)]*[*+?][^)]*)\)[*+?]/g,
+      /\(\?:([^)]*[*+?][^)]*)\)[*+?]/g
+    ]
+    for (const np of nestedPatterns) {
+      let m: RegExpExecArray | null
+      while ((m = np.exec(pattern)) !== null) {
+        addRisk({
+          type: 'nested_quantifier',
+          description: '嵌套量词：外层量词作用于内部含有量词的表达式，形成指数级状态空间',
+          pattern: m[0],
+          position: m.index,
+          suggestion: '解套量词，使用展开式写法替代嵌套重复结构',
+          badExample: '([0-9]+)*',
+          goodExample: '[0-9]*'
+        })
+        upgradeRisk('high')
+        maxBacktrackPotential = Math.max(maxBacktrackPotential, 5000)
+      }
+      np.lastIndex = 0
+    }
+  }
+
+  function checkOverlappingAlternation(pattern: string) {
+    const orPattern = /\(([^()|]*\|[^()|]*)\)([*+?]|{\d+,})?/g
+    let m: RegExpExecArray | null
+    while ((m = orPattern.exec(pattern)) !== null) {
+      const alternates = m[1].split('|')
+      for (let i = 0; i < alternates.length; i++) {
+        for (let j = i + 1; j < alternates.length; j++) {
+          const a = alternates[i].trim()
+          const b = alternates[j].trim()
+          if (a.length > 0 && b.length > 0 && (a.startsWith(b) || b.startsWith(a) || a === b)) {
+            const isRepeated = !!m[2]
+            addRisk({
+              type: 'overlapping_alternation',
+              description: isRepeated ? '重叠选择分支 + 量词：两个分支可匹配相同内容，重复时会大量回溯' : '重叠选择分支：两个分支前缀相同，匹配失败时会尝试全部组合',
+              pattern: m[0],
+              position: m.index,
+              suggestion: '将更长的分支放在前面，或使用锚点/边界消除歧义，避免对含重叠分支的分组施加量词',
+              badExample: '(a|ab)*c',
+              goodExample: '(ab|a)?c 或 a(?:b)?c'
+            })
+            upgradeRisk(isRepeated ? 'critical' : 'medium')
+            maxBacktrackPotential = Math.max(maxBacktrackPotential, isRepeated ? 8000 : 500)
+          }
+        }
+      }
+    }
+    orPattern.lastIndex = 0
+
+    const greedyOr = /([^|()]+)\|([^|()]+)([*+?])/g
+    while ((m = greedyOr.exec(pattern)) !== null) {
+      const a = m[1].trim()
+      const b = m[2].trim()
+      if (a.length > 0 && b.length > 0 && (a.endsWith(b.slice(0, 1)) || b.endsWith(a.slice(0, 1)))) {
+        addRisk({
+          type: 'overlapping_alternation',
+          description: '选择分支的末尾与下一分支开头重叠，会触发额外回溯尝试',
+          pattern: m[0],
+          position: m.index,
+          suggestion: '重构分支顺序，消除公共前缀/后缀的歧义',
+          badExample: 'ab|bc+',
+          goodExample: 'a(?:b|bc)+'
+        })
+        upgradeRisk('low')
+        maxBacktrackPotential = Math.max(maxBacktrackPotential, 200)
+      }
+    }
+    greedyOr.lastIndex = 0
+  }
+
+  function checkAdjacentRepeating(pattern: string) {
+    const adjacent = /([.[\]\\\w\d()]+[*+?])([\s]*)([.[\]\\\w\d()]+[*+?])/g
+    let m: RegExpExecArray | null
+    while ((m = adjacent.exec(pattern)) !== null) {
+      const left = m[1]
+      const right = m[3]
+      const leftMatchAny = /\.|\[.*\^.*\]|\\[dwsS]/.test(left)
+      const rightMatchAny = /\.|\[.*\^.*\]|\\[dwsS]/.test(right)
+      if (leftMatchAny && rightMatchAny) {
+        addRisk({
+          type: 'adjacent_repeating',
+          description: '相邻通配量词：两个相邻的量词都能匹配任意字符，边界模糊导致大量回溯尝试',
+          pattern: m[0],
+          position: m.index,
+          suggestion: '明确两个量词之间的分隔边界（如锚点、固定字符），或使用占有优先量词消除回溯',
+          badExample: '.*.*x',
+          goodExample: '[^x]*x'
+        })
+        upgradeRisk('high')
+        maxBacktrackPotential = Math.max(maxBacktrackPotential, 3000)
+      } else if (leftMatchAny || rightMatchAny) {
+        addRisk({
+          type: 'adjacent_repeating',
+          description: '相邻的重复结构可能因边界不清晰产生不必要的回溯尝试',
+          pattern: m[0],
+          position: m.index,
+          suggestion: '添加明确的分隔符或锚点以界定两部分的边界',
+          badExample: '\\w+\\d*',
+          goodExample: '(\\w+?)(\\d*)'
+        })
+        upgradeRisk('medium')
+        maxBacktrackPotential = Math.max(maxBacktrackPotential, 400)
+      }
+    }
+    adjacent.lastIndex = 0
+  }
+
+  function checkWideCharclass(pattern: string) {
+    const widePatterns = [
+      { regex: /\\s\s*\\S/g, msg: '[\\s\\S] 型：匹配任意字符+量词在长文本会产生大量分支' },
+      { regex: /\\d\s*\\D/g, msg: '[\\d\\D] 型：数字与非数字组合+量词等于全匹配' },
+      { regex: /\\w\s*\\W/g, msg: '[\\w\\W] 型：词与非词组合等于匹配任意字符' },
+      { regex: /\[\^\\?[\w]\]\*/g, msg: '否定字符类+贪婪量词：匹配直到失败才回溯，长串时开销大' }
+    ]
+    for (const wp of widePatterns) {
+      let m: RegExpExecArray | null
+      while ((m = wp.regex.exec(pattern)) !== null) {
+        const followedByQuantifier = /[*+?{]/.test(pattern[m.index + m[0].length] || '')
+        if (followedByQuantifier) {
+          addRisk({
+            type: 'wide_charclass',
+            description: wp.msg,
+            pattern: m[0] + (pattern[m.index + m[0].length] || ''),
+            position: m.index,
+            suggestion: '如果确实需要匹配任意字符，考虑使用非贪婪量词或增加锚点限制匹配范围',
+            badExample: '[\\s\\S]*end',
+            goodExample: '(?:(?!end)[\\s\\S])*end'
+          })
+          upgradeRisk('high')
+          maxBacktrackPotential = Math.max(maxBacktrackPotential, 6000)
+        }
+      }
+      wp.regex.lastIndex = 0
+    }
+  }
+
+  function checkGreedyWithBacktrack(pattern: string) {
+    const greedyDotStar = /\.\*([^.$\[\]\\|()*+?])(?!\$)/g
+    let m: RegExpExecArray | null
+    while ((m = greedyDotStar.exec(pattern)) !== null) {
+      const afterChar = m[1]
+      const occurrenceCount = (testString.match(new RegExp(afterChar.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length
+      if (occurrenceCount > 3 || testString.length > 30) {
+        addRisk({
+          type: 'greedy_with_backtrack',
+          description: `贪婪 .* 后跟固定字符 '${afterChar}'：会先吞掉全部字符串，再逐字符回退查找，在目标字符出现次数多（${occurrenceCount}次）时反复回溯`,
+          pattern: m[0],
+          position: m.index,
+          suggestion: `改用否定字符类 [^${afterChar}]* 替代 .*，一次性前进到目标位置而无需回溯`,
+          badExample: `.*${afterChar}`,
+          goodExample: `[^${afterChar}]*${afterChar}`
+        })
+        upgradeRisk(occurrenceCount > 8 ? 'critical' : 'medium')
+        maxBacktrackPotential = Math.max(maxBacktrackPotential, occurrenceCount * 100)
+      }
+    }
+    greedyDotStar.lastIndex = 0
+
+    const plusBacktrack = /\.\+([^.$\[\]\\|()*+?])/g
+    while ((m = plusBacktrack.exec(pattern)) !== null) {
+      addRisk({
+        type: 'greedy_with_backtrack',
+        description: `贪婪 .+ 后跟固定字符：至少匹配一次后再回退，长字符串下同样会产生大量回溯`,
+        pattern: m[0],
+        position: m.index,
+        suggestion: '使用非贪婪 .+? 或否定字符类消除不必要的回退',
+        badExample: '.+end',
+        goodExample: '[^e]+end 或 .+?end'
+      })
+      upgradeRisk('low')
+      maxBacktrackPotential = Math.max(maxBacktrackPotential, 150)
+    }
+    plusBacktrack.lastIndex = 0
+  }
+
+  try {
+    checkNestedQuantifiers(pattern)
+    checkOverlappingAlternation(pattern)
+    checkAdjacentRepeating(pattern)
+    checkWideCharclass(pattern)
+    checkGreedyWithBacktrack(pattern)
+  } catch (e) {
+  }
+
+  if (riskSources.length === 0) {
+    const quantifierCount = (pattern.match(/[*+?]/g) || []).length
+    if (quantifierCount >= 4) {
+      upgradeRisk('low')
+      addRisk({
+        type: 'greedy_with_backtrack',
+        description: '多个量词同时存在：虽然无明显冲突，但组合后仍可能在极端输入下产生较多步骤',
+        pattern: `共${quantifierCount}个量词`,
+        position: 0,
+        suggestion: '如果性能敏感，可审查各量词间是否存在边界模糊的情况',
+        badExample: 'a*b*c*d*e',
+        goodExample: '根据实际需要减少或明确各部分边界'
+      })
+      maxBacktrackPotential = Math.max(maxBacktrackPotential, 50)
+    }
+  }
+
+  const complexityMap: Record<RiskLevel, string> = {
+    safe: 'O(n) 线性',
+    low: 'O(n·k) 近似线性',
+    medium: 'O(n²) 平方级',
+    high: 'O(2ⁿ) 指数级',
+    critical: 'O(n!) / 灾难级'
+  }
+
+  let warning: string | null = null
+  if (riskLevel === 'critical') {
+    warning = '⚠ 严重：此正则在输入较长或结构不利时可能引发灾难性回溯，导致浏览器卡死，请务必重构！'
+  } else if (riskLevel === 'high') {
+    warning = '⚠ 警告：此正则存在较高回溯风险，在长文本匹配时可能显著变慢'
+  } else if (riskLevel === 'medium') {
+    warning = '⚠ 提示：此正则可能产生中等程度的回溯，建议优化以获得最佳性能'
+  }
+
+  return {
+    riskLevel,
+    estimatedComplexity: complexityMap[riskLevel],
+    riskSources,
+    maxBacktrackPotential,
+    warning
+  }
+}
+
 export const useRegexStore = defineStore('regex', () => {
   const pattern = ref('^([a-zA-Z0-9._%+-]+)@([a-zA-Z0-9.-]+)\\.([a-zA-Z]{2,})$')
   const testString = ref('user@example.com admin@mail.org invalid-email')
@@ -403,6 +690,10 @@ export const useRegexStore = defineStore('regex', () => {
   const selectedTemplate = ref<string>('')
 
   const groupColors = GROUP_COLORS
+
+  const complexityEstimate = computed<ComplexityEstimate>(() => {
+    return analyzeComplexity(pattern.value, testString.value)
+  })
 
   const matchHighlight = computed(() => {
     if (!matchResult.value || !matchResult.value.matched) return null
@@ -481,7 +772,7 @@ export const useRegexStore = defineStore('regex', () => {
 
   return {
     pattern, testString, currentStep, isPlaying, nfa, matchResult, ast, error,
-    selectedTemplate, groupColors, matchHighlight,
+    selectedTemplate, groupColors, matchHighlight, complexityEstimate,
     execute, setPattern, setTestString, applyTemplate,
     stepForward, stepBackward, resetStep, play, stop
   }

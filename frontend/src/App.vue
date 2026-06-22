@@ -8,6 +8,7 @@
     <div class="flex flex-col lg:flex-row gap-4 p-4">
       <div class="lg:w-1/4 space-y-4">
         <RegexEditor />
+        <ComplexityEstimate />
         <TemplateLibrary />
       </div>
 
@@ -61,6 +62,7 @@
 import { onMounted } from 'vue'
 import { useRegexStore } from './store/regex'
 import RegexEditor from './components/RegexEditor.vue'
+import ComplexityEstimate from './components/ComplexityEstimate.vue'
 import NfaVisualizer from './components/NfaVisualizer.vue'
 import MatchHighlight from './components/MatchHighlight.vue'
 import TemplateLibrary from './components/TemplateLibrary.vue'
