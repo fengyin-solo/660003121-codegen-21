@@ -26,25 +26,40 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { useRegexStore } from '../store/regex'
 
 const store = useRegexStore()
 const localPattern = ref(store.pattern)
 const localTestString = ref(store.testString)
 
-let debounceTimer: ReturnType<typeof setTimeout>
+let executeTimer: ReturnType<typeof setTimeout>
+function debounceExecute() {
+  clearTimeout(executeTimer)
+  executeTimer = setTimeout(() => { store.execute() }, 500)
+}
+
 function onInput() {
-  clearTimeout(debounceTimer)
-  debounceTimer = setTimeout(() => { store.setPattern(localPattern.value) }, 300)
+  store.updatePattern(localPattern.value)
+  debounceExecute()
 }
 function onTestInput() {
-  clearTimeout(debounceTimer)
-  debounceTimer = setTimeout(() => { store.setTestString(localTestString.value) }, 300)
+  store.updateTestString(localTestString.value)
+  debounceExecute()
 }
 function execute() {
-  store.setPattern(localPattern.value)
-  store.setTestString(localTestString.value)
+  clearTimeout(executeTimer)
+  store.updatePattern(localPattern.value)
+  store.updateTestString(localTestString.value)
   store.execute()
 }
+
+watch(
+  () => store.pattern,
+  (v) => { if (v !== localPattern.value) localPattern.value = v }
+)
+watch(
+  () => store.testString,
+  (v) => { if (v !== localTestString.value) localTestString.value = v }
+)
 </script>

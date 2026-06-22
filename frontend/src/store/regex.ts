@@ -733,6 +733,14 @@ export const useRegexStore = defineStore('regex', () => {
     execute()
   }
 
+  function updatePattern(p: string) {
+    pattern.value = p
+  }
+
+  function updateTestString(s: string) {
+    testString.value = s
+  }
+
   function applyTemplate(t: RegexTemplate) {
     pattern.value = t.pattern
     testString.value = t.testString
@@ -773,7 +781,7 @@ export const useRegexStore = defineStore('regex', () => {
   return {
     pattern, testString, currentStep, isPlaying, nfa, matchResult, ast, error,
     selectedTemplate, groupColors, matchHighlight, complexityEstimate,
-    execute, setPattern, setTestString, applyTemplate,
+    execute, setPattern, setTestString, updatePattern, updateTestString, applyTemplate,
     stepForward, stepBackward, resetStep, play, stop
   }
 })
